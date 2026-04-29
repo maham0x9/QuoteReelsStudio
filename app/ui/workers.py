@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 
 from PySide6.QtCore import QObject, QThread, Signal
 
@@ -42,12 +43,21 @@ class SearchWorker(QObject):
             )
             self.failed.emit(self.quote.id, err)
             return
-        # Cache thumbs in parallel with a hard time budget so the UI never
-        # hangs on a slow / unreachable preview server.
-        from concurrent.futures import ThreadPoolExecutor, wait
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            futs = [ex.submit(self.manager.cache_thumb, o) for o in opts]
-            wait(futs, timeout=8.0)
+        # Cache thumbs on daemon threads with a hard wall-clock budget. We
+        # explicitly avoid ``with ThreadPoolExecutor(...) as ex`` — its
+        # __exit__ calls ``shutdown(wait=True)`` which blocks on hung
+        # downloads regardless of any ``wait()`` timeout we set.
+        threads: list[threading.Thread] = []
+        for o in opts:
+            th = threading.Thread(
+                target=self.manager.cache_thumb, args=(o,), daemon=True
+            )
+            th.start()
+            threads.append(th)
+        deadline = time.monotonic() + 8.0
+        for th in threads:
+            remaining = max(0.0, deadline - time.monotonic())
+            th.join(remaining)
         self.finished.emit(self.quote.id, opts)
 
 

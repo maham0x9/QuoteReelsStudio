@@ -104,7 +104,7 @@ class BackgroundManager:
         dest.parent.mkdir(parents=True, exist_ok=True)
         if not dest.exists():
             try:
-                r = requests.get(opt.preview_url, timeout=15)
+                r = requests.get(opt.preview_url, timeout=6)
                 r.raise_for_status()
                 dest.write_bytes(r.content)
             except requests.RequestException as e:
