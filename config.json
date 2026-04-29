@@ -1,0 +1,13 @@
+{
+  "pexels_api_key": "",
+  "pixabay_api_key": "",
+  "default_resolution": [1080, 1920],
+  "default_fps": 30,
+  "default_bitrate": "8M",
+  "default_clip_duration": 8.0,
+  "ffmpeg_path": "",
+  "music_dir": "app/assets/music",
+  "fonts_dir": "app/assets/fonts",
+  "projects_dir": "projects",
+  "cache_dir": "cache"
+}
