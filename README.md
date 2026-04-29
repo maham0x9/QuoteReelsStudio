@@ -44,36 +44,34 @@ QuoteReelsStudio/
 └── projects/               # per-user JSON projects (gitignored)
 ```
 
-## Setup
+## Setup (Windows, one-click)
 
-```bash
-python -m venv .venv
-.venv\Scripts\activate            # PowerShell:  .venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
+1. Copy `.env.example` to `.env` and paste in your **Pexels** + **Pixabay**
+   API keys.
+2. Double-click **`run.bat`**. The first launch creates a local `.venv`,
+   installs the Python dependencies, then opens the app. Subsequent
+   launches skip straight to the app.
 
-### API keys
-
-Either set environment variables:
+### Setup (manual)
 
 ```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 $env:PEXELS_API_KEY  = "…"
 $env:PIXABAY_API_KEY = "…"
+python main.py
 ```
 
-…or open `config.json` and fill the matching fields. A sibling
-`config.local.json` (gitignored) is also merged if present.
+You can also fill `config.json` (or a sibling `config.local.json`) with the
+keys instead of using environment variables.
 
 * Pexels: free key at <https://www.pexels.com/api/>
 * Pixabay: free key at <https://pixabay.com/api/docs/>
 
-### Run
-
-```bash
-python main.py
-```
-
 ### Build standalone Windows .exe
+
+Double-click **`build.bat`**, or run manually:
 
 ```powershell
 pip install pyinstaller
