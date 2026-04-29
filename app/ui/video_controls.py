@@ -1,11 +1,15 @@
-"""Right-side video controls + music selector."""
+"""Right-side video controls — minimal version.
+
+Exposes only: clip duration, dark overlay slider, music selector. Other
+``VideoSettings`` fields keep their defaults (loop short clips, mute original
+audio, no blur, 1.0× speed).
+"""
 from __future__ import annotations
 
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFileDialog,
@@ -15,7 +19,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QSlider,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -35,55 +38,33 @@ class VideoControls(QWidget):
 
     def _build(self) -> None:
         v = QVBoxLayout(self)
-        v.setContentsMargins(8, 8, 8, 8)
-        v.addWidget(QLabel("<b>Video</b>"))
+        v.setContentsMargins(10, 10, 10, 10)
+        v.setSpacing(10)
 
-        gb_clip = QGroupBox("Clip")
-        f1 = QFormLayout(gb_clip)
+        header = QLabel("Video")
+        header.setObjectName("SectionHeader")
+        v.addWidget(header)
+
+        gb = QGroupBox("Settings")
+        f = QFormLayout(gb)
+        f.setContentsMargins(10, 10, 10, 10)
+        f.setHorizontalSpacing(10)
+        f.setVerticalSpacing(10)
+        f.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
         self.duration = QDoubleSpinBox()
-        self.duration.setRange(1.0, 60.0)
+        self.duration.setRange(3.0, 60.0)
+        self.duration.setSingleStep(1.0)
         self.duration.setSuffix(" s")
         self.duration.setValue(8.0)
-        f1.addRow("Duration", self.duration)
-
-        self.trim_start = QDoubleSpinBox()
-        self.trim_start.setRange(0.0, 600.0)
-        self.trim_start.setSuffix(" s")
-        f1.addRow("Trim start", self.trim_start)
-
-        self.loop_cb = QCheckBox("Loop short clips")
-        self.loop_cb.setChecked(True)
-        f1.addRow("Loop", self.loop_cb)
-
-        self.speed = QDoubleSpinBox()
-        self.speed.setRange(0.25, 4.0)
-        self.speed.setSingleStep(0.05)
-        self.speed.setValue(1.0)
-        f1.addRow("Speed", self.speed)
-        v.addWidget(gb_clip)
-
-        gb_look = QGroupBox("Look")
-        f2 = QFormLayout(gb_look)
-        self.blur_cb = QCheckBox("Blur background")
-        self.blur_strength = QSpinBox()
-        self.blur_strength.setRange(1, 40)
-        self.blur_strength.setValue(12)
-        blur_row = QHBoxLayout()
-        blur_row.addWidget(self.blur_cb)
-        blur_row.addWidget(QLabel("strength"))
-        blur_row.addWidget(self.blur_strength)
-        blur_w = QWidget()
-        blur_w.setLayout(blur_row)
-        f2.addRow("Blur", blur_w)
+        f.addRow("Duration", self.duration)
 
         self.dark = QSlider(Qt.Horizontal)
         self.dark.setRange(0, 80)
         self.dark.setValue(35)
-        f2.addRow("Dark overlay", self.dark)
-        v.addWidget(gb_look)
+        self.dark.setMinimumHeight(24)
+        f.addRow("Dark overlay", self.dark)
 
-        gb_audio = QGroupBox("Audio")
-        f3 = QFormLayout(gb_audio)
         self.music_combo = QComboBox()
         self.music_combo.setEditable(False)
         self.refresh_music_list()
@@ -94,28 +75,14 @@ class VideoControls(QWidget):
         m_row.addWidget(self.music_browse)
         m_w = QWidget()
         m_w.setLayout(m_row)
-        f3.addRow("Music", m_w)
+        f.addRow("Music", m_w)
 
-        self.music_vol = QSlider(Qt.Horizontal)
-        self.music_vol.setRange(0, 100)
-        self.music_vol.setValue(60)
-        f3.addRow("Music volume", self.music_vol)
-
-        self.mute_cb = QCheckBox("Mute original audio")
-        self.mute_cb.setChecked(True)
-        f3.addRow("Mute", self.mute_cb)
-        v.addWidget(gb_audio)
-
+        v.addWidget(gb)
         v.addStretch(1)
 
-        for w in (
-            self.duration, self.trim_start, self.speed, self.blur_strength, self.dark,
-            self.music_vol,
-        ):
-            w.valueChanged.connect(self._emit)
-        for cb in (self.loop_cb, self.blur_cb, self.mute_cb):
-            cb.toggled.connect(self._emit)
-        self.music_combo.currentTextChanged.connect(self._emit)
+        self.duration.valueChanged.connect(self._emit)
+        self.dark.valueChanged.connect(self._emit)
+        self.music_combo.currentIndexChanged.connect(self._emit)
 
     def refresh_music_list(self) -> None:
         cfg = get_config()
@@ -132,46 +99,47 @@ class VideoControls(QWidget):
                 self.music_combo.setCurrentIndex(idx)
         self.music_combo.blockSignals(False)
 
+    # ------------------------------------------------------------------ binding
     def bind(self, settings: VideoSettings) -> None:
         self._settings = settings
         self._suppress = True
         self.duration.setValue(settings.duration)
-        self.trim_start.setValue(settings.trim_start)
-        self.loop_cb.setChecked(settings.loop_short)
-        self.speed.setValue(settings.speed)
-        self.blur_cb.setChecked(settings.blur_bg)
-        self.blur_strength.setValue(settings.blur_strength)
         self.dark.setValue(int(settings.dark_overlay * 100))
         idx = self.music_combo.findData(settings.music_path)
         self.music_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        self.music_vol.setValue(int(settings.music_volume * 100))
-        self.mute_cb.setChecked(settings.mute_original)
         self._suppress = False
 
+    def _emit(self) -> None:
+        if self._suppress or not self._settings:
+            return
+        self._settings.duration = float(self.duration.value())
+        self._settings.dark_overlay = self.dark.value() / 100.0
+        self._settings.music_path = self.music_combo.currentData() or ""
+        # silently keep sensible defaults
+        self._settings.loop_short = True
+        self._settings.mute_original = True
+        self._settings.blur_bg = False
+        self._settings.speed = 1.0
+        self._settings.trim_start = 0.0
+        self._settings.music_volume = 0.6
+        self.settings_changed.emit(self._settings)
+
+    # ------------------------------------------------------------------ actions
     def _on_browse_music(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Choose music", "",
+            self, "Choose music file", "",
             "Audio (*.mp3 *.m4a *.wav *.aac *.ogg);;All files (*)",
         )
         if not path:
             return
-        # copy / track absolute path; just add to combo dynamically
+        cfg = get_config()
+        # If the user picked a file outside the music dir, copy a reference
+        # link rather than the file itself (keeps things lightweight).
+        existing = self.music_combo.findData(path)
+        if existing >= 0:
+            self.music_combo.setCurrentIndex(existing)
+            return
         name = Path(path).stem
         self.music_combo.addItem(name, path)
         self.music_combo.setCurrentIndex(self.music_combo.count() - 1)
-
-    def _emit(self, *_args) -> None:
-        if self._suppress or not self._settings:
-            return
-        s = self._settings
-        s.duration = self.duration.value()
-        s.trim_start = self.trim_start.value()
-        s.loop_short = self.loop_cb.isChecked()
-        s.speed = self.speed.value()
-        s.blur_bg = self.blur_cb.isChecked()
-        s.blur_strength = self.blur_strength.value()
-        s.dark_overlay = self.dark.value() / 100.0
-        s.music_path = self.music_combo.currentData() or ""
-        s.music_volume = self.music_vol.value() / 100.0
-        s.mute_original = self.mute_cb.isChecked()
-        self.settings_changed.emit(s)
+        _ = cfg  # silence unused warning; reserved for future copy-on-import

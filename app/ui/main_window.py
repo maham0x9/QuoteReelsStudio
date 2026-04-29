@@ -1,4 +1,8 @@
-"""Main application window — wires every panel + workers together."""
+"""Main application window — minimal version.
+
+Three-pane layout (quotes / canvas+backgrounds / text+video controls) plus
+a thin top toolbar (Settings) and a bottom action bar (export + progress).
+"""
 from __future__ import annotations
 
 import logging
@@ -8,27 +12,29 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, QTimer
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QFileDialog,
-    QInputDialog,
+    QLabel,
     QMainWindow,
     QMessageBox,
+    QSizePolicy,
     QSplitter,
     QStatusBar,
+    QToolBar,
     QVBoxLayout,
     QWidget,
 )
 
 from app.api import BackgroundManager
 from app.config import get_config
-from app.models import Project, Quote, StylePreset, TextLayer, VideoSettings
+from app.models import Project, Quote, TextLayer, VideoSettings
 from app.render import RenderPipeline
-from app.store import ProjectStore, TemplateStore
 
 from .backgrounds_panel import BackgroundsPanel
 from .editor_canvas import EditorCanvas
 from .quotes_panel import QuotesPanel
+from .settings_dialog import SettingsDialog
 from .styles import DARK_QSS
 from .text_controls import TextControls
 from .timeline import Timeline
@@ -42,13 +48,11 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("QuoteReelsStudio")
-        self.resize(1500, 900)
+        self.resize(1400, 880)
         self.setStyleSheet(DARK_QSS)
 
         self.cfg = get_config()
         self.project = Project()
-        self.project_store = ProjectStore(self.cfg)
-        self.template_store = TemplateStore(self.cfg)
         self.bg_manager = BackgroundManager(self.cfg)
         self.pipeline = RenderPipeline(self.cfg)
 
@@ -61,32 +65,30 @@ class MainWindow(QMainWindow):
         self._refresh_timer.timeout.connect(self._refresh_canvas_text)
 
         self._build_ui()
-        self._build_menu()
+        self._build_toolbar()
 
-        if not self.bg_manager.is_configured:
-            QMessageBox.information(
-                self, "API keys missing",
-                "Set Pexels and/or Pixabay keys in config.json or via the "
-                "PEXELS_API_KEY / PIXABAY_API_KEY environment variables to "
-                "enable automatic background search.",
-            )
+        QTimer.singleShot(150, self._maybe_prompt_for_keys)
 
     # ---------------------------------------------------------------- layout
     def _build_ui(self) -> None:
         # left
-        self.quotes_panel = QuotesPanel(self.project, self.project_store.recent())
-        # center: canvas + bg row
+        self.quotes_panel = QuotesPanel(self.project)
+
+        # center
         center = QWidget()
         cv = QVBoxLayout(center)
         cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(8)
         self.canvas = EditorCanvas(canvas_size=self.project.resolution)
         cv.addWidget(self.canvas, 5)
         self.backgrounds_panel = BackgroundsPanel()
         cv.addWidget(self.backgrounds_panel, 2)
+
         # right
         right = QWidget()
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(8)
         self.text_controls = TextControls()
         rv.addWidget(self.text_controls, 3)
         self.video_controls = VideoControls()
@@ -99,66 +101,57 @@ class MainWindow(QMainWindow):
         h_split.setStretchFactor(0, 2)
         h_split.setStretchFactor(1, 5)
         h_split.setStretchFactor(2, 2)
-        h_split.setSizes([320, 800, 360])
+        h_split.setSizes([300, 780, 320])
 
         self.timeline = Timeline()
 
-        v_split = QSplitter(Qt.Vertical)
-        v_split.addWidget(h_split)
-        v_split.addWidget(self.timeline)
-        v_split.setStretchFactor(0, 8)
-        v_split.setStretchFactor(1, 1)
-        v_split.setSizes([700, 200])
+        root = QWidget()
+        rl = QVBoxLayout(root)
+        rl.setContentsMargins(0, 0, 0, 0)
+        rl.setSpacing(0)
+        rl.addWidget(h_split, 1)
+        rl.addWidget(self.timeline)
 
-        self.setCentralWidget(v_split)
+        self.setCentralWidget(root)
         self.setStatusBar(QStatusBar())
 
         # signals
         self.quotes_panel.quote_selected.connect(self._on_quote_selected)
         self.quotes_panel.quotes_changed.connect(self._on_quotes_changed)
-        self.quotes_panel.new_project_requested.connect(self._new_project)
-        self.quotes_panel.open_project_requested.connect(self._open_project)
         self.backgrounds_panel.option_selected.connect(self._on_option_selected)
         self.backgrounds_panel.regenerate_requested.connect(self._regenerate_current)
         self.text_controls.layer_changed.connect(self._on_layer_changed)
-        self.text_controls.auto_center_requested.connect(self._auto_center)
         self.video_controls.settings_changed.connect(self._on_video_changed)
         self.canvas.layer_changed.connect(self._on_canvas_layer_changed)
         self.timeline.export_requested.connect(self._export_batch)
         self.timeline.cancel_requested.connect(self._cancel_render)
 
-    def _build_menu(self) -> None:
-        bar = self.menuBar()
-        file_menu = bar.addMenu("&File")
-        new_act = QAction("&New project", self, shortcut=QKeySequence.New, triggered=self._new_project)
-        open_act = QAction("&Open project…", self, shortcut=QKeySequence.Open, triggered=self._open_project_dialog)
-        save_act = QAction("&Save", self, shortcut=QKeySequence.Save, triggered=self._save_project)
-        save_as_act = QAction("Save &As…", self, shortcut=QKeySequence("Ctrl+Shift+S"), triggered=self._save_project_as)
-        quit_act = QAction("&Quit", self, shortcut=QKeySequence.Quit, triggered=self.close)
-        for a in (new_act, open_act, save_act, save_as_act):
-            file_menu.addAction(a)
-        file_menu.addSeparator()
-        file_menu.addAction(quit_act)
+    def _build_toolbar(self) -> None:
+        tb = QToolBar()
+        tb.setMovable(False)
+        tb.setIconSize(self._icon_size())
+        self.addToolBar(Qt.TopToolBarArea, tb)
 
-        proj_menu = bar.addMenu("&Project")
-        proj_menu.addAction(QAction("Fetch backgrounds for &all", self,
-                                    shortcut=QKeySequence("Ctrl+Shift+B"),
-                                    triggered=self._search_all))
-        proj_menu.addAction(QAction("&Apply template to all…", self,
-                                    triggered=self._apply_template_to_all))
-        proj_menu.addAction(QAction("&Save current as template…", self,
-                                    triggered=self._save_template))
-        proj_menu.addSeparator()
-        proj_menu.addAction(QAction("&Export batch…", self,
-                                    shortcut=QKeySequence("Ctrl+E"),
-                                    triggered=self._export_batch))
+        title = QLabel("  QuoteReelsStudio  ")
+        title.setStyleSheet(
+            "color:#FFFFFF; font-weight:700; font-size:15px;"
+            "padding: 4px 12px;"
+        )
+        tb.addWidget(title)
 
-        help_menu = bar.addMenu("&Help")
-        help_menu.addAction(QAction("Open project folder", self,
-                                    triggered=lambda: self._open_path(self.cfg.projects_path)))
-        help_menu.addAction(QAction("Open cache folder", self,
-                                    triggered=lambda: self._open_path(self.cfg.cache_path)))
-        help_menu.addAction(QAction("About", self, triggered=self._about))
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        tb.addWidget(spacer)
+
+        settings_act = QAction("⚙  Settings", self)
+        settings_act.setToolTip("Set Pexels and Pixabay API keys")
+        settings_act.triggered.connect(self._open_settings)
+        tb.addAction(settings_act)
+
+    @staticmethod
+    def _icon_size():
+        from PySide6.QtCore import QSize
+        return QSize(18, 18)
 
     # ---------------------------------------------------------------- helpers
     def _current_quote(self) -> Quote | None:
@@ -181,59 +174,25 @@ class MainWindow(QMainWindow):
         except Exception as e:  # pragma: no cover
             self._set_status(f"Could not open {path}: {e}")
 
-    # ---------------------------------------------------------------- project
-    def _new_project(self) -> None:
-        if self.project.quotes:
-            ans = QMessageBox.question(
-                self, "New project",
-                "Discard current project? Unsaved changes will be lost.",
+    # ---------------------------------------------------------------- settings
+    def _maybe_prompt_for_keys(self) -> None:
+        if not self.bg_manager.is_configured:
+            QMessageBox.information(
+                self, "Set API keys",
+                "Add your Pexels and/or Pixabay API key from Settings to enable "
+                "automatic background search.\n\nBoth are free.",
             )
-            if ans != QMessageBox.Yes:
-                return
-        self.project = Project()
-        self.bg_manager.reset_dedupe()
-        self.quotes_panel.set_project(self.project)
-        self.timeline.set_project(self.project)
-        self._active_quote_id = ""
-        self._set_status("New project")
 
-    def _open_project_dialog(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open project", str(self.cfg.projects_path),
-            "Project (*.json);;All files (*)",
-        )
-        if path:
-            self._open_project(path)
-
-    def _open_project(self, path: str) -> None:
-        try:
-            self.project = self.project_store.load(path)
-        except Exception as e:
-            QMessageBox.warning(self, "Open failed", str(e))
-            return
-        self.bg_manager.reset_dedupe()
-        self.quotes_panel.set_project(self.project)
-        self.quotes_panel.set_recent(self.project_store.recent())
-        self.timeline.set_project(self.project)
-        if self.project.quotes:
-            self._on_quote_selected(self.project.quotes[0].id)
-        self._set_status(f"Opened {Path(path).name}")
-
-    def _save_project(self) -> None:
-        if not self.project.name or self.project.name == "Untitled Project":
-            self._save_project_as()
-            return
-        path = self.project_store.save(self.project)
-        self.quotes_panel.set_recent(self.project_store.recent())
-        self._set_status(f"Saved {path.name}")
-
-    def _save_project_as(self) -> None:
-        name, ok = QInputDialog.getText(self, "Save project", "Project name:",
-                                        text=self.project.name)
-        if not ok or not name.strip():
-            return
-        self.project.name = name.strip()
-        self._save_project()
+    def _open_settings(self) -> None:
+        dlg = SettingsDialog(self.cfg, self)
+        if dlg.exec():
+            # rebuild manager so new keys take effect
+            self.bg_manager = BackgroundManager(self.cfg)
+            if self.bg_manager.is_configured:
+                self._set_status("API keys saved")
+                QTimer.singleShot(50, self._search_missing)
+            else:
+                self._set_status("API keys cleared")
 
     # ---------------------------------------------------------------- quotes
     def _on_quotes_changed(self) -> None:
@@ -287,24 +246,13 @@ class MainWindow(QMainWindow):
             if not q.options:
                 self._search_for_quote(q)
 
-    def _search_all(self) -> None:
-        if not self.bg_manager.is_configured:
-            QMessageBox.warning(self, "API keys missing",
-                                "Add Pexels/Pixabay keys to config.json first.")
-            return
-        self.bg_manager.reset_dedupe()
-        for q in self.project.quotes:
-            q.options.clear()
-            q.selected_index = 0
-            self._search_for_quote(q)
-
     def _regenerate_current(self) -> None:
         q = self._current_quote()
         if not q:
             return
         if not self.bg_manager.is_configured:
             QMessageBox.warning(self, "API keys missing",
-                                "Add Pexels/Pixabay keys to config.json first.")
+                                "Open Settings and add your Pexels or Pixabay key.")
             return
         q.options.clear()
         q.selected_index = 0
@@ -312,7 +260,7 @@ class MainWindow(QMainWindow):
         self._search_for_quote(q)
 
     def _search_for_quote(self, quote: Quote) -> None:
-        worker = SearchWorker(self.bg_manager, quote, count=5)
+        worker = SearchWorker(self.bg_manager, quote, count=4)
         worker.finished.connect(self._on_search_finished)
         worker.failed.connect(lambda qid, msg: self._set_status(f"Search failed for {qid}: {msg}"))
         self._search_threads.append(run_in_thread(worker))
@@ -331,7 +279,7 @@ class MainWindow(QMainWindow):
                 break
 
     # ---------------------------------------------------------------- editing
-    def _on_layer_changed(self, layer: TextLayer) -> None:
+    def _on_layer_changed(self, _layer: TextLayer) -> None:
         self._refresh_timer.start(60)
 
     def _on_canvas_layer_changed(self, layer: TextLayer) -> None:
@@ -343,48 +291,10 @@ class MainWindow(QMainWindow):
     def _on_video_changed(self, _settings: VideoSettings) -> None:
         self.timeline.set_project(self.project)
 
-    def _auto_center(self) -> None:
-        self.canvas.auto_center_in_safe_zone()
-
-    # ---------------------------------------------------------------- templates
-    def _apply_template_to_all(self) -> None:
-        presets = self.template_store.list()
-        if not presets:
-            QMessageBox.information(self, "Templates", "No templates saved yet.")
-            return
-        names = [p.name for p in presets]
-        name, ok = QInputDialog.getItem(self, "Apply template", "Pick:", names, 0, False)
-        if not ok:
-            return
-        preset = next(p for p in presets if p.name == name)
-        for q in self.project.quotes:
-            q.text_layer = TextLayer.from_dict(preset.text_layer.to_dict())
-            q.text_layer.text = q.text
-            q.video = VideoSettings.from_dict(preset.video.to_dict())
-        if self._active_quote_id:
-            self._on_quote_selected(self._active_quote_id)
-        self.timeline.set_project(self.project)
-        self._set_status(f"Applied template: {name}")
-
-    def _save_template(self) -> None:
-        q = self._current_quote()
-        if not q:
-            return
-        name, ok = QInputDialog.getText(self, "Save template", "Name:")
-        if not ok or not name.strip():
-            return
-        preset = StylePreset(
-            name=name.strip(),
-            text_layer=TextLayer.from_dict(q.text_layer.to_dict()),
-            video=VideoSettings.from_dict(q.video.to_dict()),
-        )
-        self.template_store.save(preset)
-        self._set_status(f"Saved template '{name}'")
-
     # ---------------------------------------------------------------- export
     def _export_batch(self) -> None:
         if not self.project.quotes:
-            QMessageBox.information(self, "Export", "Add quotes first.")
+            QMessageBox.information(self, "Export", "Add at least one quote first.")
             return
         missing = [q for q in self.project.quotes if not (q.selected_option() and q.selected_option().local_path)]
         if missing:
@@ -399,7 +309,7 @@ class MainWindow(QMainWindow):
                                                    str(self.cfg.projects_path))
         if not out_dir:
             return
-        out_path = Path(out_dir) / f"{self.project.name or 'export'}"
+        out_path = Path(out_dir) / (self.project.name or "export")
         jobs = self.pipeline.jobs_for_project(self.project, out_path)
         if not jobs:
             QMessageBox.warning(self, "Export", "Nothing to render.")
@@ -426,14 +336,6 @@ class MainWindow(QMainWindow):
     def _on_render_failed(self, msg: str) -> None:
         self.timeline.set_running(False)
         QMessageBox.warning(self, "Render failed", msg)
-
-    def _about(self) -> None:
-        QMessageBox.information(
-            self, "QuoteReelsStudio",
-            "QuoteReelsStudio\n\n"
-            "Mass-produce vertical quote videos using Pexels + Pixabay backgrounds.\n"
-            "FFmpeg-backed render. Built with PySide6.",
-        )
 
     # ---------------------------------------------------------------- close
     def closeEvent(self, ev) -> None:
