@@ -41,6 +41,11 @@ class BackgroundManager:
     def is_configured(self) -> bool:
         return any(p.is_configured for p in self.providers)
 
+    def last_errors(self) -> str:
+        """Return a joined human-readable string of the last error for each provider."""
+        msgs = [getattr(p, "last_error", "") for p in self.providers]
+        return " · ".join(m for m in msgs if m)
+
     def reset_dedupe(self) -> None:
         with self._lock:
             self._used_ids.clear()

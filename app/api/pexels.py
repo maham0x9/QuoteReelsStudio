@@ -19,9 +19,10 @@ PEXELS_SEARCH = "https://api.pexels.com/videos/search"
 class PexelsClient(BackgroundProvider):
     name = "pexels"
 
-    def __init__(self, api_key: str, timeout: float = 15.0):
+    def __init__(self, api_key: str, timeout: float = 10.0):
         self.api_key = api_key
         self.timeout = timeout
+        self.last_error: str = ""
 
     @property
     def is_configured(self) -> bool:
@@ -37,10 +38,19 @@ class PexelsClient(BackgroundProvider):
             "orientation": "portrait",
             "size": "medium",
         }
+        self.last_error = ""
         try:
             r = requests.get(PEXELS_SEARCH, headers=headers, params=params, timeout=self.timeout)
+            if r.status_code in (401, 403):
+                self.last_error = (
+                    f"Pexels rejected the key ({r.status_code}). "
+                    "Open Settings and verify the Pexels API key."
+                )
+                LOG.warning(self.last_error)
+                return []
             r.raise_for_status()
         except requests.RequestException as e:
+            self.last_error = f"Pexels: {e}"
             LOG.warning("Pexels search failed for %r: %s", query, e)
             return []
         data = r.json()

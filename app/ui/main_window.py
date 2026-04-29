@@ -244,6 +244,8 @@ class MainWindow(QMainWindow):
             return
         for q in self.project.quotes:
             if not q.options:
+                if q.id == self._active_quote_id:
+                    self.backgrounds_panel.show_loading()
                 self._search_for_quote(q)
 
     def _regenerate_current(self) -> None:
@@ -262,8 +264,13 @@ class MainWindow(QMainWindow):
     def _search_for_quote(self, quote: Quote) -> None:
         worker = SearchWorker(self.bg_manager, quote, count=4)
         worker.finished.connect(self._on_search_finished)
-        worker.failed.connect(lambda qid, msg: self._set_status(f"Search failed for {qid}: {msg}"))
+        worker.failed.connect(self._on_search_failed)
         self._search_threads.append(run_in_thread(worker))
+
+    def _on_search_failed(self, quote_id: str, message: str) -> None:
+        self._set_status(f"Search failed: {message}")
+        if quote_id == self._active_quote_id:
+            self.backgrounds_panel.show_error(message)
 
     def _on_search_finished(self, quote_id: str, options: list) -> None:
         for q in self.project.quotes:

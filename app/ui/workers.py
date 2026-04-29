@@ -31,12 +31,24 @@ class SearchWorker(QObject):
     def run(self) -> None:
         try:
             opts = self.manager.search(self.quote.text, count=self.count)
-            for opt in opts:
-                self.manager.cache_thumb(opt)
-            self.finished.emit(self.quote.id, opts)
         except Exception as e:  # pragma: no cover
-            LOG.exception("SearchWorker failed: %s", e)
+            LOG.exception("SearchWorker.search raised: %s", e)
             self.failed.emit(self.quote.id, str(e))
+            return
+        if not opts:
+            err = self.manager.last_errors() or (
+                "No results returned. Verify your Pexels / Pixabay API keys "
+                "in Settings."
+            )
+            self.failed.emit(self.quote.id, err)
+            return
+        # Cache thumbs in parallel with a hard time budget so the UI never
+        # hangs on a slow / unreachable preview server.
+        from concurrent.futures import ThreadPoolExecutor, wait
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futs = [ex.submit(self.manager.cache_thumb, o) for o in opts]
+            wait(futs, timeout=8.0)
+        self.finished.emit(self.quote.id, opts)
 
 
 class DownloadWorker(QObject):

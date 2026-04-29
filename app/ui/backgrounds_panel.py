@@ -96,6 +96,13 @@ class BackgroundsPanel(QWidget):
     def show_loading(self) -> None:
         self._clear_tiles()
         self.empty_label.setText("Searching backgrounds…")
+        self.empty_label.setStyleSheet("")
+        self.empty_label.show()
+
+    def show_error(self, message: str) -> None:
+        self._clear_tiles()
+        self.empty_label.setText(message)
+        self.empty_label.setStyleSheet("color:#FF8B8B;")
         self.empty_label.show()
 
     def set_options(self, options: list[BackgroundOption], selected_index: int = 0) -> None:

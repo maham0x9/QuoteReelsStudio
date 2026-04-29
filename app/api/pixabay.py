@@ -19,9 +19,10 @@ PIXABAY_VIDEOS = "https://pixabay.com/api/videos/"
 class PixabayClient(BackgroundProvider):
     name = "pixabay"
 
-    def __init__(self, api_key: str, timeout: float = 15.0):
+    def __init__(self, api_key: str, timeout: float = 10.0):
         self.api_key = api_key
         self.timeout = timeout
+        self.last_error: str = ""
 
     @property
     def is_configured(self) -> bool:
@@ -39,10 +40,19 @@ class PixabayClient(BackgroundProvider):
             "video_type": "all",
             "safesearch": "true",
         }
+        self.last_error = ""
         try:
             r = requests.get(PIXABAY_VIDEOS, params=params, timeout=self.timeout)
+            if r.status_code in (400, 401, 403):
+                self.last_error = (
+                    f"Pixabay rejected the key ({r.status_code}). "
+                    "Open Settings and verify the Pixabay API key."
+                )
+                LOG.warning(self.last_error)
+                return []
             r.raise_for_status()
         except requests.RequestException as e:
+            self.last_error = f"Pixabay: {e}"
             LOG.warning("Pixabay search failed for %r: %s", query, e)
             return []
         data = r.json()
@@ -65,10 +75,11 @@ class PixabayClient(BackgroundProvider):
                     best = f
             if not best:
                 continue
-            pic = v.get("picture_id")
-            preview = (
-                f"https://i.vimeocdn.com/video/{pic}_295x166.jpg" if pic else ""
-            )
+            preview = best.get("thumbnail") or ""
+            if not preview:
+                pic = v.get("picture_id")
+                if pic:
+                    preview = f"https://i.vimeocdn.com/video/{pic}_295x166.jpg"
             out.append(
                 BackgroundOption(
                     provider=self.name,
