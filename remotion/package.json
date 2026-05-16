@@ -8,6 +8,7 @@
     "build": "remotion bundle src/index.ts",
     "render": "remotion render src/index.ts Landscape4k out/video.mp4",
     "render:hd": "remotion render src/index.ts Landscape4k out/video.mp4 --width=1920 --height=1080",
+    "render:autonomous": "remotion render src/index.ts AutonomousDevMatrix out/autonomous_dev_matrix.mp4",
     "typecheck": "tsc --noEmit",
     "upgrade": "remotion upgrade"
   },
