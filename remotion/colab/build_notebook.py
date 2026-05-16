@@ -226,6 +226,15 @@ CONFIG = {
     "retries":       1,               # extra attempts after the first failure
     "per_render_timeout_min": 90,     # kill render if it exceeds this
 
+    # --- Speed vs quality preset ------------------------------------------
+    # "stock": leaves all render specs as-is (the visually-lossless defaults
+    #          that pass Pond5/Adobe Stock/Shutterstock QC).
+    # "fast":  drops JPEG quality 100->90 (still visually lossless for stock)
+    #          and switches x264 preset medium->fast. ~2-3x faster capture +
+    #          encode on a 2-vCPU runtime, output is still excellent.
+    # None / unset behaves like "stock".
+    "speed_profile": "stock",
+
     # --- Notifications -----------------------------------------------------
     # Set to a Slack incoming-webhook URL (or Discord, etc.). None disables.
     "webhook_url":   None,
@@ -315,8 +324,37 @@ def detect_nvenc() -> bool:
     except Exception:
         return False
 
+def detect_gpu() -> bool:
+    \"\"\"Return True iff nvidia-smi succeeds (i.e. a usable NVIDIA GPU is
+    attached and the driver is healthy). Used to upgrade gl_backend from the
+    safe-but-slow software default ('swangle') to GPU-accelerated 'egl'.\"\"\"
+    try:
+        res = subprocess.run(
+            ["nvidia-smi", "-L"],
+            capture_output=True, text=True, check=False, timeout=10,
+        )
+        return res.returncode == 0 and "GPU" in res.stdout
+    except Exception:
+        return False
+
 NVENC_AVAILABLE = CONFIG["use_nvenc"] and detect_nvenc()
 log(f"GPU encoder (h264_nvenc) detected: {NVENC_AVAILABLE}")
+
+GPU_AVAILABLE = detect_gpu()
+log(f"NVIDIA GPU detected: {GPU_AVAILABLE}")
+if GPU_AVAILABLE and CONFIG["gl_backend"] == "swangle":
+    CONFIG["gl_backend"] = "egl"
+    log(f"  -> auto-upgrading gl_backend swangle -> egl (uses the GPU)")
+
+# Optional speed profile. "stock" is the visually-lossless default the user
+# already configured. "fast" trades a bit of quality for ~2-3x faster
+# capture: drops JPEG quality 100 -> 90 (still visually lossless for stock),
+# uses libx264 preset "fast", and accepts the auto-egl backend if GPU is
+# available. Set to None (or omit) to keep the user's CONFIG verbatim.
+if CONFIG.get("speed_profile") == "fast":
+    CONFIG["jpeg_quality"] = min(CONFIG["jpeg_quality"], 90)
+    CONFIG["x264_preset"]  = "fast"
+    log(f"speed_profile=fast -> jpeg_quality={CONFIG['jpeg_quality']}, x264_preset={CONFIG['x264_preset']}")
 
 
 # --- Streamed subprocess --------------------------------------------------
@@ -334,11 +372,13 @@ import re as _re_for_progress
 import select as _select_for_io
 
 # Module-level so list_compositions and render both refer to the same regexes.
-RENDER_PHASE_RE = _re_for_progress.compile(
-    r"\\b(Bundling|Rendering(?:\\s+frames)?|Encoding(?:\\s+video)?)\\b",
-    _re_for_progress.IGNORECASE,
-)
-RENDER_COUNT_RE = _re_for_progress.compile(r"(\\d+)\\s*/\\s*(\\d+)")
+RENDER_BUNDLING_RE  = _re_for_progress.compile(r"\\bBundl(?:e|ing)\\b",   _re_for_progress.IGNORECASE)
+RENDER_RENDERING_RE = _re_for_progress.compile(r"\\bRender(?:ing)?\\b",   _re_for_progress.IGNORECASE)
+RENDER_ENCODING_RE  = _re_for_progress.compile(r"\\bEncod(?:e|ing)\\b",   _re_for_progress.IGNORECASE)
+RENDER_COUNT_RE     = _re_for_progress.compile(r"(\\d+)\\s*/\\s*(\\d+)")
+# Phases are ordered low-to-high. Once we've advanced past Bundling we never
+# go back, even if a later progress line still contains the word "Bundled".
+PHASE_RANK = {"Bundling": 0, "Rendering frames": 1, "Encoding video": 2}
 
 def _fmt_dur(seconds: float) -> str:
     s = int(max(0, seconds))
@@ -379,13 +419,16 @@ def run_streamed(
     last_cur = 0
     last_total = 0
 
-    def _normalize_phase(raw: str) -> str:
-        low = raw.lower()
-        if low.startswith("bundl"):
-            return "Bundling"
-        if low.startswith("encod"):
+    def _detect_phase(line: str) -> str | None:
+        \"\"\"Return the most advanced phase whose keyword appears on the line,
+        or None if no phase keyword is present.\"\"\"
+        if RENDER_ENCODING_RE.search(line):
             return "Encoding video"
-        return "Rendering frames"
+        if RENDER_RENDERING_RE.search(line):
+            return "Rendering frames"
+        if RENDER_BUNDLING_RE.search(line):
+            return "Bundling"
+        return None
 
     def _emit(line: str) -> None:
         nonlocal last_print, last_output, phase, phase_start, last_cur, last_total
@@ -397,15 +440,13 @@ def run_streamed(
             del tail[: len(tail) - 80]
         last_output = time.time()
         if progress_re is not None:
-            phase_m = RENDER_PHASE_RE.search(line)
-            if phase_m:
-                normalized = _normalize_phase(phase_m.group(1))
-                if normalized != phase:
-                    phase = normalized
-                    phase_start = time.time()
-                    last_cur = 0
-                    last_total = 0
-                    log(f"{prefix}{phase}…")
+            new_phase = _detect_phase(line)
+            if new_phase and (phase is None or PHASE_RANK[new_phase] > PHASE_RANK[phase]):
+                phase = new_phase
+                phase_start = time.time()
+                last_cur = 0
+                last_total = 0
+                log(f"{prefix}{phase}…")
             count_m = RENDER_COUNT_RE.search(line)
             if count_m and phase:
                 try:
