@@ -69,7 +69,10 @@ export const ParticleField: React.FC<{ parallaxX: number; parallaxY: number }> =
           parallaxY * (0.2 + p.z * 0.8);
         const twinkle = 0.4 + 0.6 * (0.5 + 0.5 * loopSin(frame, p.twinkleCycles, p.phase));
         const opacity = (0.15 + p.z * 0.55) * twinkle;
-        const glow = 6 + p.z * 18;
+        // Single wider box-shadow visually matches the previous two-stop
+        // (glow + 2.2*glow) stack. Halves the compositor passes for 220
+        // particles per frame.
+        const glow = (6 + p.z * 18) * 1.7;
         return (
           <div
             key={i}
@@ -82,7 +85,7 @@ export const ParticleField: React.FC<{ parallaxX: number; parallaxY: number }> =
               borderRadius: "50%",
               background: p.color,
               opacity,
-              boxShadow: `0 0 ${glow}px ${p.color}, 0 0 ${glow * 2.2}px ${p.color}`,
+              boxShadow: `0 0 ${glow}px ${p.color}`,
               willChange: "transform, opacity",
             }}
           />

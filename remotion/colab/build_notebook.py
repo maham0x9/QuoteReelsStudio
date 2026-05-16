@@ -202,10 +202,14 @@ CONFIG = {
     # Remotion's --concurrency = how many Chrome tabs render frames in
     # parallel. Each tab eats ~400-600 MB. Colab containers REPORT 24+
     # logical CPUs via os.cpu_count() but the free runtime only actually
-    # has 2 vCPUs and ~12 GB RAM, so anything above ~4 here will OOM-thrash
-    # and the render looks frozen. Capped at 4 by default; bump it
-    # manually if you're on Colab Pro+/a beefier runtime.
-    "concurrency":   min(4, max(1, os.cpu_count() or 2)),
+    # has 2 vCPUs and ~12 GB RAM, so a naive cpu_count() default OOM-thrashes.
+    # Leave at "auto" to let cell 4 pick the right number based on actual
+    # hardware + GPU presence:
+    #   * NVIDIA GPU runtime (T4/L4/A100) -> min(8, max(4, cpu_count))
+    #   * Anything else (CPU/TPU runtimes) -> min(4, max(1, cpu_count))
+    # Override with an int if you know what your runtime can handle
+    # (e.g. CONFIG["concurrency"] = 12 on a beefy Pro+ instance).
+    "concurrency":   "auto",
     # Use ANGLE (software GL) for stability in Colab. Set to "angle" or
     # "swangle". Set "egl" if you actually have a working GPU (rare in Colab).
     "gl_backend":    "swangle",
@@ -345,6 +349,26 @@ log(f"NVIDIA GPU detected: {GPU_AVAILABLE}")
 if GPU_AVAILABLE and CONFIG["gl_backend"] == "swangle":
     CONFIG["gl_backend"] = "egl"
     log(f"  -> auto-upgrading gl_backend swangle -> egl (uses the GPU)")
+
+# Resolve "auto" concurrency into a concrete integer now that we know
+# whether a GPU is attached. With GPU acceleration each Chrome tab waits
+# on the GPU rather than the CPU, so we can run more tabs without OOM
+# thrashing; without GPU each tab is fully CPU-bound and 4 is a safe cap.
+# An int already set by the user (CONFIG["concurrency"] = 8) is left as-is.
+_conc = CONFIG.get("concurrency", "auto")
+if _conc == "auto":
+    _cores = _os_for_env.cpu_count() or 2
+    if GPU_AVAILABLE:
+        CONFIG["concurrency"] = min(8, max(4, _cores))
+    else:
+        CONFIG["concurrency"] = min(4, max(1, _cores))
+    log(
+        f"  -> auto concurrency = {CONFIG['concurrency']}"
+        f" (cores={_cores}, gpu={GPU_AVAILABLE})"
+    )
+elif not isinstance(_conc, int) or _conc < 1:
+    log(f"  WARNING: invalid concurrency {_conc!r}, falling back to 2")
+    CONFIG["concurrency"] = 2
 
 # Optional speed profile. "stock" is the visually-lossless default the user
 # already configured. "fast" trades a bit of quality for ~2-3x faster
