@@ -104,6 +104,23 @@ QT_QPA_PLATFORM=offscreen pytest -q
 
 CI runs lint (`ruff`) + the head-less Qt smoke test on every push.
 
+## Remotion (4K 16:9 landscape videos)
+
+A separate Remotion (Node) sub-project lives under `remotion/` for programmatic
+4K landscape (3840×2160, 16:9) renders up to 20 seconds. It is independent of
+the PySide6 app and does not affect the vertical TikTok/Reels pipeline.
+
+```bash
+cd remotion
+npm install
+npm run studio        # open Remotion Studio in the browser
+npm run render        # render the Landscape4k composition to out/video.mp4
+npm run typecheck     # tsc --noEmit
+```
+
+The composition defaults are configured in `remotion/src/Root.tsx`:
+`Landscape4k` — 3840×2160, 30 fps, 600 frames (20 seconds).
+
 ## License
 
 MIT

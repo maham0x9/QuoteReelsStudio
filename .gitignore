@@ -30,3 +30,12 @@ config.local.json
 # Output renders
 out/
 exports/
+
+# Node / Remotion
+node_modules/
+remotion/build/
+remotion/out/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
