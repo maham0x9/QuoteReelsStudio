@@ -1,0 +1,30 @@
+{
+  "name": "quote-reels-studio-remotion",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Remotion compositions for QuoteReelsStudio (4K 16:9, up to 20s)",
+  "scripts": {
+    "studio": "remotion studio src/index.ts",
+    "build": "remotion bundle src/index.ts",
+    "render": "remotion render src/index.ts Landscape4k out/video.mp4",
+    "render:hd": "remotion render src/index.ts Landscape4k out/video.mp4 --width=1920 --height=1080",
+    "typecheck": "tsc --noEmit",
+    "upgrade": "remotion upgrade"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.462",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "remotion": "4.0.462",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.5",
+    "@types/react": "19.0.7",
+    "@types/react-dom": "19.0.3",
+    "typescript": "5.7.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
