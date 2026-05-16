@@ -180,6 +180,14 @@ CONFIG = {
     "projects_root": Path("/content/drive/MyDrive/remotion-projects"),
     "output_root":   Path("/content/drive/MyDrive/remotion-renders"),
 
+    # --- Local workspace --------------------------------------------------
+    # IMPORTANT: npm cannot install into the Drive mount (FUSE doesn't allow
+    # the symlinks npm wants for node_modules/.bin/*, and the deep tree is
+    # painfully slow). The renderer mirrors each project from Drive to a
+    # workspace on Colab's local SSD, runs npm + Remotion there, and writes
+    # the final MP4 directly back to Drive. Survives until the runtime ends.
+    "workspace_root": Path("/content/_remotion_workspaces"),
+
     # --- Render specs (overrides per-project remotion.config.ts) ----------
     "width":         1920,
     "height":        1080,
@@ -221,12 +229,14 @@ CONFIG = {
     "webhook_name":  "Remotion Batch Render",
 }
 
-# Make sure output folder exists.
+# Make sure output + workspace folders exist.
 CONFIG["output_root"].mkdir(parents=True, exist_ok=True)
+CONFIG["workspace_root"].mkdir(parents=True, exist_ok=True)
 
-print("projects_root:", CONFIG["projects_root"])
-print("output_root:  ", CONFIG["output_root"])
-print("concurrency:  ", CONFIG["concurrency"])
+print("projects_root: ", CONFIG["projects_root"])
+print("output_root:   ", CONFIG["output_root"])
+print("workspace_root:", CONFIG["workspace_root"])
+print("concurrency:   ", CONFIG["concurrency"])
 """,
     )
 )
@@ -304,6 +314,81 @@ def detect_nvenc() -> bool:
 
 NVENC_AVAILABLE = CONFIG["use_nvenc"] and detect_nvenc()
 log(f"GPU encoder (h264_nvenc) detected: {NVENC_AVAILABLE}")
+
+
+# --- Streamed subprocess --------------------------------------------------
+# Used by every Node/Remotion command we run. Streams output line-by-line so
+# you can watch progress, throttles progress prints if a regex is supplied,
+# enforces a timeout, and returns (returncode, last_50_lines_joined) so the
+# tail is always available for error reporting.
+def run_streamed(
+    cmd: list[str],
+    cwd: Path,
+    timeout_s: int,
+    progress_re=None,
+    prefix: str = "    ",
+    quiet: bool = False,
+) -> tuple[int, str]:
+    proc = subprocess.Popen(
+        cmd, cwd=str(cwd),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    deadline = time.time() + timeout_s
+    tail: list[str] = []
+    last_print = 0.0
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            tail.append(line)
+            if len(tail) > 80:
+                tail = tail[-80:]
+            now = time.time()
+            if progress_re is not None:
+                m = progress_re.search(line)
+                if m and (now - last_print) > 1.0:
+                    phase, cur, total = m.group(1), m.group(2), m.group(3)
+                    pct = (int(cur) / int(total)) * 100
+                    log(f"{prefix}{phase}: {cur}/{total} ({pct:0.1f}%)")
+                    last_print = now
+                elif not m and ("error" in line.lower() or "✘" in line):
+                    log(f"{prefix}{line}")
+            elif not quiet:
+                log(f"{prefix}{line}")
+            if time.time() > deadline:
+                proc.kill()
+                raise TimeoutError(f"command exceeded {timeout_s}s: {' '.join(cmd[:3])}")
+    finally:
+        proc.wait()
+    return proc.returncode, "\\n".join(tail[-50:])
+
+
+def mirror_to_workspace(project: Path) -> Path:
+    \"\"\"Copy a project from its Drive location to the local-SSD workspace.
+    Excludes node_modules / out / build / .cache so installs are not blown
+    away each time. Returns the workspace path; subsequent npm + render runs
+    should use this path instead of the Drive one.\"\"\"
+    ws = CONFIG["workspace_root"] / project.name
+    ws.mkdir(parents=True, exist_ok=True)
+    rsync_cmd = [
+        "rsync", "-a", "--delete-after",
+        "--exclude", "node_modules",
+        "--exclude", "out",
+        "--exclude", "build",
+        "--exclude", ".cache",
+        "--exclude", ".remotion",
+        "--exclude", ".git",
+        "--exclude", ".colab_install_hash",
+        f"{project}/", f"{ws}/",
+    ]
+    log(f"  mirror Drive -> workspace: {project.name} -> {ws}")
+    rc, tail = run_streamed(rsync_cmd, cwd=Path("/tmp"), timeout_s=15 * 60, quiet=True)
+    if rc != 0:
+        raise RuntimeError(f"rsync to workspace failed (rc={rc})\\n{tail}")
+    return ws
 """,
     )
 )
@@ -395,22 +480,28 @@ def _lock_hash(project: Path) -> str:
     pkg = project / "package.json"
     return hashlib.sha256(pkg.read_bytes()).hexdigest() if pkg.is_file() else ""
 
-def ensure_project_installed(project: Path) -> None:
-    node_modules = project / "node_modules"
+def ensure_project_installed(workspace: Path) -> None:
+    \"\"\"Run `npm ci` (or `npm install`) inside the local workspace. Skips when
+    the lockfile/package.json hash matches the previous successful install.\"\"\"
+    node_modules = workspace / "node_modules"
     stamp = node_modules / ".colab_install_hash"
-    want = _lock_hash(project)
+    want = _lock_hash(workspace)
     have = stamp.read_text().strip() if stamp.is_file() else ""
     if node_modules.is_dir() and want and want == have:
-        log(f"  npm: cache hit ({project.name})")
+        log(f"  npm: cache hit ({workspace.name})")
         return
-    log(f"  npm: installing dependencies in {project.name} (this can take a few minutes)")
-    cmd = ["npm", "ci"] if (project / "package-lock.json").is_file() else ["npm", "install"]
-    cmd.extend(["--no-audit", "--no-fund", "--prefer-offline"])
-    subprocess.run(cmd, cwd=project, check=True)
+    log(f"  npm: installing dependencies in {workspace} (this can take a few minutes)")
+    cmd = ["npm", "ci"] if (workspace / "package-lock.json").is_file() else ["npm", "install"]
+    cmd.extend(["--no-audit", "--no-fund", "--loglevel=error"])
+    rc, tail = run_streamed(cmd, cwd=workspace, timeout_s=20 * 60)
+    if rc != 0:
+        raise RuntimeError(
+            f"`{' '.join(cmd)}` exited {rc} in {workspace}\\n--- last npm output ---\\n{tail}"
+        )
     try:
         stamp.write_text(want)
     except OSError:
-        pass  # Drive race conditions are non-fatal
+        pass
 """,
     )
 )
@@ -478,64 +569,29 @@ def _build_render_cmd(project: Path, entry: Path, comp: str, output: Path) -> li
     cmd.extend(["--fps", str(CONFIG["fps"])])
     return cmd
 
-def _run_render(cmd: list[str], cwd: Path, timeout_s: int) -> tuple[int, str]:
-    \"\"\"Stream stdout, echo progress lines, return (returncode, last_tail).\"\"\"
-    proc = subprocess.Popen(
-        cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1,
-    )
-    deadline = time.time() + timeout_s
-    tail: list[str] = []
-    last_print = 0.0
-    try:
-        assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.rstrip()
-            if not line:
-                continue
-            tail.append(line)
-            if len(tail) > 50:
-                tail = tail[-50:]
-            # Throttle progress prints to once per second per phase
-            m = PROGRESS_RE.search(line)
-            now = time.time()
-            if m and (now - last_print) > 1.0:
-                phase, cur, total = m.group(1), m.group(2), m.group(3)
-                pct = (int(cur) / int(total)) * 100
-                log(f"    {phase}: {cur}/{total} ({pct:0.1f}%)")
-                last_print = now
-            elif not m and ("error" in line.lower() or "✘" in line):
-                log(f"    {line}")
-            if time.time() > deadline:
-                proc.kill()
-                raise TimeoutError(f"render exceeded {timeout_s}s")
-    finally:
-        proc.wait()
-    return proc.returncode, "\\n".join(tail[-25:])
-
-def render_composition(project: Path, entry: Path, comp: dict) -> RenderResult:
-    out_dir = CONFIG["output_root"] / project.name
+def render_composition(workspace: Path, entry: Path, comp: dict, project_name: str) -> RenderResult:
+    out_dir = CONFIG["output_root"] / project_name
     out_dir.mkdir(parents=True, exist_ok=True)
     output = out_dir / f"{comp['id']}.mp4"
 
     if CONFIG["skip_existing"] and output.is_file() and output.stat().st_size > 0:
-        log(f"  skip {project.name}/{comp['id']} (already rendered)")
-        return RenderResult(project.name, comp["id"], str(output), True, 0.0, 0)
+        log(f"  skip {project_name}/{comp['id']} (already rendered)")
+        return RenderResult(project_name, comp["id"], str(output), True, 0.0, 0)
 
     timeout_s = CONFIG["per_render_timeout_min"] * 60
     attempts = 1 + CONFIG["retries"]
     last_err = ""
     t0 = time.time()
     for attempt in range(1, attempts + 1):
-        cmd = _build_render_cmd(project, entry, comp["id"], output)
-        log(f"  render {project.name}/{comp['id']} (attempt {attempt}/{attempts})")
+        cmd = _build_render_cmd(workspace, entry, comp["id"], output)
+        log(f"  render {project_name}/{comp['id']} (attempt {attempt}/{attempts})")
         log(f"    cmd: {' '.join(cmd)}")
         try:
-            rc, tail = _run_render(cmd, project, timeout_s)
+            rc, tail = run_streamed(cmd, cwd=workspace, timeout_s=timeout_s, progress_re=PROGRESS_RE)
             if rc == 0 and output.is_file() and output.stat().st_size > 0:
                 dt = time.time() - t0
-                log(f"  ✔ {project.name}/{comp['id']} in {dt:0.1f}s -> {output}")
-                return RenderResult(project.name, comp["id"], str(output), True, dt, attempt)
+                log(f"  ✔ {project_name}/{comp['id']} in {dt:0.1f}s -> {output}")
+                return RenderResult(project_name, comp["id"], str(output), True, dt, attempt)
             last_err = f"exit={rc}\\n{tail}"
             log(f"  ✘ attempt {attempt} failed:\\n{tail}")
         except TimeoutError as te:
@@ -545,7 +601,7 @@ def render_composition(project: Path, entry: Path, comp: dict) -> RenderResult:
         time.sleep(3)
 
     return RenderResult(
-        project.name, comp["id"], str(output), False,
+        project_name, comp["id"], str(output), False,
         time.time() - t0, attempts, error=last_err,
     )
 """,
@@ -584,12 +640,11 @@ CELLS.append(
                 f"(available: {list(by_id)})")
     return out
 
-def _clear_caches(project: Path) -> None:
-    \"\"\"Drop the Remotion bundle cache between projects so we don't bloat the
-    Drive folder or hit stale bundles after dependency upgrades.\"\"\"
-    for c in (project / "node_modules" / ".cache",
-              project / ".remotion",
-              project / "build"):
+def _clear_caches(workspace: Path) -> None:
+    \"\"\"Drop the Remotion bundle cache between projects (keeps node_modules so
+    re-runs are still fast).\"\"\"
+    for c in (workspace / ".remotion",
+              workspace / "build"):
         if c.is_dir():
             shutil.rmtree(c, ignore_errors=True)
 
@@ -606,26 +661,36 @@ def batch_render() -> list[RenderResult]:
     for i, project in enumerate(projects, 1):
         log("")
         log(f"=== [{i}/{len(projects)}] {project.name} ===")
+
         try:
-            ensure_project_installed(project)
-        except subprocess.CalledProcessError as e:
+            workspace = mirror_to_workspace(project)
+        except Exception as e:
+            err = f"mirror to workspace failed: {e}"
+            log(f"  ✘ {err}")
+            results.append(RenderResult(project.name, "", "", False, 0.0, 1, err))
+            notify(f":x: `{project.name}` — mirror to workspace failed")
+            continue
+
+        try:
+            ensure_project_installed(workspace)
+        except (subprocess.CalledProcessError, RuntimeError) as e:
             err = f"npm install failed: {e}"
             log(f"  ✘ {err}")
             results.append(RenderResult(project.name, "", "", False, 0.0, 1, err))
-            notify(f":x: `{project.name}` — npm install failed")
+            notify(f":x: `{project.name}` — npm install failed:\\n```{str(e)[:1500]}```")
             continue
 
-        entry = find_entry(project)
+        entry = find_entry(workspace)
         if not entry:
-            err = "No entry point found (looked for src/index.tsx, src/Root.tsx, ...)"
+            err = "No entry point found (looked for src/index.tsx, src/index.ts, src/Root.tsx, ...)"
             log(f"  ✘ {err}")
             results.append(RenderResult(project.name, "", "", False, 0.0, 1, err))
             notify(f":x: `{project.name}` — {err}")
             continue
-        log(f"  entry: {entry.relative_to(project)}")
+        log(f"  entry: {entry.relative_to(workspace)}")
 
         try:
-            comps = list_compositions(project, entry)
+            comps = list_compositions(workspace, entry)
         except Exception as e:
             err = f"`remotion compositions` failed: {e}"
             log(f"  ✘ {err}")
@@ -640,7 +705,7 @@ def batch_render() -> list[RenderResult]:
         log(f"  compositions: {[c['id'] for c in picked]}")
 
         for comp in picked:
-            r = render_composition(project, entry, comp)
+            r = render_composition(workspace, entry, comp, project.name)
             results.append(r)
             if r.ok:
                 notify(f":white_check_mark: `{r.project}/{r.composition}` -> {r.output}")
@@ -648,7 +713,7 @@ def batch_render() -> list[RenderResult]:
                 notify(f":x: `{r.project}/{r.composition}` failed after "
                        f"{r.attempts} attempt(s):\\n```{r.error[:1500]}```")
 
-        _clear_caches(project)
+        _clear_caches(workspace)
 
     dt = time.time() - total_t0
     ok = sum(1 for r in results if r.ok)
@@ -817,8 +882,20 @@ CELLS.append(
         "markdown",
         """## Troubleshooting
 
-- **"`remotion: command not found`"** — `npm install` didn't complete. Re-run
-  Step 6 manually: `subprocess.run(["npm", "ci"], cwd=project, check=True)`.
+- **`npm install failed: ... exit status 1`** — almost always means npm is
+  trying to install onto the Drive mount. This notebook avoids that by
+  mirroring each project to `CONFIG["workspace_root"]`
+  (`/content/_remotion_workspaces/<project>/`) before running npm. If you
+  still see it, check that (a) you're on the latest notebook revision and
+  (b) the install log printed above the error names a path under
+  `/content/_remotion_workspaces`, not `/content/drive/...`. If the path is
+  on Drive, your `CONFIG["workspace_root"]` is wrong.
+- **`npm install` peer-dep errors** — re-running Step 7 with
+  `--legacy-peer-deps` usually fixes it. Edit `ensure_project_installed`
+  and append `"--legacy-peer-deps"` to the `cmd.extend(...)` line, then
+  delete `/content/_remotion_workspaces/<project>/node_modules` and re-run.
+- **"`remotion: command not found`"** — `npm install` didn't complete. Look
+  at the streamed npm output (it's printed inline) for the real error.
 - **Render dies with `Failed to launch the browser process`** — usually a
   missing system lib. Re-run Step 2; the apt install list covers the libs
   Remotion's Chrome shell needs on Ubuntu/Debian.
@@ -827,16 +904,17 @@ CELLS.append(
   takes ~10–15 min depending on scene complexity. Switching to a GPU runtime
   speeds up the *Chrome rendering* side (`gl_backend="angle"`), but H.264
   encoding is CPU-bound unless `h264_nvenc` is available (rare on Colab).
-- **"`Cannot find module 'X'`"** when listing compositions — usually a
-  package-lock mismatch on Drive. Delete `node_modules/.colab_install_hash`
-  in that project to force a clean `npm ci`.
+- **"`Cannot find module 'X'`"** when listing compositions — a stale
+  workspace install. Delete `/content/_remotion_workspaces/<project>/` and
+  re-run Step 9.
 - **Drive write errors mid-render** — Remotion writes the final MP4 in one
   shot, so a Drive hiccup near the end can leave a partial file. Re-running
   the batch will redo only the missing/empty outputs (because of
   `skip_existing`).
-- **Colab disconnects** — you'll lose the runtime but every finished MP4 is
+- **Colab disconnects** — you lose `/content/_remotion_workspaces/` (so the
+  next session will re-mirror + re-install), but every finished MP4 is
   already on Drive. Reconnect, re-mount Drive, re-run Step 9; finished
-  projects are skipped automatically.
+  renders are skipped automatically.
 """,
     )
 )

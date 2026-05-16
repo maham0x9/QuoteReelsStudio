@@ -80,21 +80,33 @@ with a warning.
 
 ## Defaults
 
-| Setting        | Value         | Notes                                                  |
-| -------------- | ------------- | ------------------------------------------------------ |
-| Resolution     | 1920x1080     | Override via `CONFIG["width"]`, `CONFIG["height"]`     |
-| FPS            | 30            |                                                        |
-| Codec          | `h264`        |                                                        |
-| CRF            | 16            | 14–18 is visually lossless for stock                   |
-| x264 preset    | `medium`      | `slow` produces smaller files, slower                  |
-| Pixel format   | `yuv420p`     | Required by Shutterstock / Adobe Stock                 |
-| JPEG quality   | 100           | Frame source quality (no banding)                      |
-| Concurrency    | `cpu_count()` | Bump on Colab Pro / Pro+                               |
-| GL backend     | `swangle`     | Stable in Colab; try `angle` on a GPU runtime          |
-| NVENC          | auto-detected | Only if `ffmpeg -encoders` lists `h264_nvenc`          |
-| Retry          | 1 extra       | After the first failure                                |
-| Per-render TTL | 90 min        | Hard timeout; kills the renderer                       |
-| Skip existing  | True          | Re-runs are incremental                                |
+| Setting         | Value                              | Notes                                                  |
+| --------------- | ---------------------------------- | ------------------------------------------------------ |
+| Resolution      | 1920x1080                          | Override via `CONFIG["width"]`, `CONFIG["height"]`     |
+| FPS             | 30                                 |                                                        |
+| Codec           | `h264`                             |                                                        |
+| CRF             | 16                                 | 14–18 is visually lossless for stock                   |
+| x264 preset     | `medium`                           | `slow` produces smaller files, slower                  |
+| Pixel format    | `yuv420p`                          | Required by Shutterstock / Adobe Stock                 |
+| JPEG quality    | 100                                | Frame source quality (no banding)                      |
+| Concurrency     | `cpu_count()`                      | Bump on Colab Pro / Pro+                               |
+| GL backend      | `swangle`                          | Stable in Colab; try `angle` on a GPU runtime          |
+| NVENC           | auto-detected                      | Only if `ffmpeg -encoders` lists `h264_nvenc`          |
+| Workspace root  | `/content/_remotion_workspaces`    | Local SSD; npm + render run here, NOT on Drive         |
+| Retry           | 1 extra                            | After the first failure                                |
+| Per-render TTL  | 90 min                             | Hard timeout; kills the renderer                       |
+| Skip existing   | True                               | Re-runs are incremental                                |
+
+### Why a local workspace?
+
+`npm install` cannot run against the Google Drive mount — Drive's FUSE
+filesystem doesn't allow the symlinks npm wants for `node_modules/.bin/*`
+and is painfully slow on deep trees, so installs fail or hang. The notebook
+mirrors each project from `MyDrive/remotion-projects/<name>/` to
+`/content/_remotion_workspaces/<name>/` (local SSD), runs `npm ci` and
+`npx remotion render` there, and writes the final MP4 directly back to
+Drive. The workspace is wiped when the Colab runtime ends, but every
+finished MP4 is already safe on Drive.
 
 ## Performance
 
