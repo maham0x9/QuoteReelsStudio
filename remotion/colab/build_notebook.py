@@ -419,9 +419,8 @@ def run_streamed(
     last_cur = 0
     last_total = 0
 
-    def _detect_phase(line: str) -> str | None:
-        \"\"\"Return the most advanced phase whose keyword appears on the line,
-        or None if no phase keyword is present.\"\"\"
+    def _detect_phase_from_kw(line: str) -> str | None:
+        \"\"\"Phase implied by keyword (Encoding > Rendering > Bundling).\"\"\"
         if RENDER_ENCODING_RE.search(line):
             return "Encoding video"
         if RENDER_RENDERING_RE.search(line):
@@ -440,14 +439,27 @@ def run_streamed(
             del tail[: len(tail) - 80]
         last_output = time.time()
         if progress_re is not None:
-            new_phase = _detect_phase(line)
+            kw_phase = _detect_phase_from_kw(line)
+            count_m = RENDER_COUNT_RE.search(line)
+            # Heuristic: bundling progress uses tiny chunk counts (typically
+            # N/<50); a per-frame count of 100+ that isn't an Encoding line is
+            # virtually always Rendering. This catches Remotion log formats
+            # where a 'Bundled' past-tense line latches the phase and later
+            # frame-progress lines come without a phase keyword.
+            new_phase = kw_phase
+            if count_m:
+                try:
+                    _t = int(count_m.group(2))
+                except ValueError:
+                    _t = 0
+                if _t >= 100 and new_phase != "Encoding video":
+                    new_phase = "Rendering frames"
             if new_phase and (phase is None or PHASE_RANK[new_phase] > PHASE_RANK[phase]):
                 phase = new_phase
                 phase_start = time.time()
                 last_cur = 0
                 last_total = 0
                 log(f"{prefix}{phase}…")
-            count_m = RENDER_COUNT_RE.search(line)
             if count_m and phase:
                 try:
                     cur = int(count_m.group(1))
