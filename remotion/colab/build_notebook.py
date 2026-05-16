@@ -199,10 +199,13 @@ CONFIG = {
     "jpeg_quality":  100,
 
     # --- Performance -------------------------------------------------------
-    # Remotion's --concurrency controls how many Chrome tabs render frames
-    # in parallel. Colab usually has 2 vCPUs (free) or 4 (Pro), so 2 is a
-    # safe default. Bump on bigger runtimes.
-    "concurrency":   max(1, (os.cpu_count() or 2) // 1),
+    # Remotion's --concurrency = how many Chrome tabs render frames in
+    # parallel. Each tab eats ~400-600 MB. Colab containers REPORT 24+
+    # logical CPUs via os.cpu_count() but the free runtime only actually
+    # has 2 vCPUs and ~12 GB RAM, so anything above ~4 here will OOM-thrash
+    # and the render looks frozen. Capped at 4 by default; bump it
+    # manually if you're on Colab Pro+/a beefier runtime.
+    "concurrency":   min(4, max(1, os.cpu_count() or 2)),
     # Use ANGLE (software GL) for stability in Colab. Set to "angle" or
     # "swangle". Set "egl" if you actually have a working GPU (rare in Colab).
     "gl_backend":    "swangle",
@@ -317,10 +320,14 @@ log(f"GPU encoder (h264_nvenc) detected: {NVENC_AVAILABLE}")
 
 
 # --- Streamed subprocess --------------------------------------------------
-# Used by every Node/Remotion command we run. Streams output line-by-line so
-# you can watch progress, throttles progress prints if a regex is supplied,
-# enforces a timeout, and returns (returncode, last_50_lines_joined) so the
-# tail is always available for error reporting.
+# Used by every Node/Remotion command we run. Reads raw bytes from stdout
+# and splits on BOTH "\\n" and "\\r" so we still see Remotion's progress
+# updates (which use carriage returns to rewrite the same line). Throttles
+# progress prints if a regex is supplied, enforces a timeout, and returns
+# (returncode, last_50_lines_joined) so the tail is always available for
+# error reporting.
+import os as _os_for_env
+
 def run_streamed(
     cmd: list[str],
     cwd: Path,
@@ -329,38 +336,73 @@ def run_streamed(
     prefix: str = "    ",
     quiet: bool = False,
 ) -> tuple[int, str]:
+    env = _os_for_env.environ.copy()
+    env.setdefault("FORCE_COLOR", "0")
+    env.setdefault("NO_COLOR", "1")
+    env.setdefault("CI", "true")  # nudges some CLIs to use line-mode output
     proc = subprocess.Popen(
         cmd, cwd=str(cwd),
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, bufsize=1,
+        bufsize=0, env=env,
     )
     deadline = time.time() + timeout_s
     tail: list[str] = []
     last_print = 0.0
+    buf = bytearray()
+
+    def _emit(line: str) -> None:
+        nonlocal last_print
+        line = line.rstrip()
+        if not line:
+            return
+        tail.append(line)
+        if len(tail) > 80:
+            del tail[: len(tail) - 80]
+        now = time.time()
+        if progress_re is not None:
+            m = progress_re.search(line)
+            if m and (now - last_print) > 1.0:
+                phase, cur, total = m.group(1), m.group(2), m.group(3)
+                try:
+                    pct = (int(cur) / int(total)) * 100
+                except (ValueError, ZeroDivisionError):
+                    pct = 0.0
+                log(f"{prefix}{phase}: {cur}/{total} ({pct:0.1f}%)")
+                last_print = now
+            elif not m and ("error" in line.lower() or "✘" in line):
+                log(f"{prefix}{line}")
+        elif not quiet:
+            log(f"{prefix}{line}")
+
     try:
         assert proc.stdout is not None
-        for line in proc.stdout:
-            line = line.rstrip()
-            if not line:
-                continue
-            tail.append(line)
-            if len(tail) > 80:
-                tail = tail[-80:]
-            now = time.time()
-            if progress_re is not None:
-                m = progress_re.search(line)
-                if m and (now - last_print) > 1.0:
-                    phase, cur, total = m.group(1), m.group(2), m.group(3)
-                    pct = (int(cur) / int(total)) * 100
-                    log(f"{prefix}{phase}: {cur}/{total} ({pct:0.1f}%)")
-                    last_print = now
-                elif not m and ("error" in line.lower() or "✘" in line):
-                    log(f"{prefix}{line}")
-            elif not quiet:
-                log(f"{prefix}{line}")
+        while True:
             if time.time() > deadline:
                 proc.kill()
                 raise TimeoutError(f"command exceeded {timeout_s}s: {' '.join(cmd[:3])}")
+            chunk = proc.stdout.read1(4096) if hasattr(proc.stdout, "read1") else proc.stdout.read(4096)
+            if not chunk:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.05)
+                continue
+            buf.extend(chunk)
+            while True:
+                nl = buf.find(b"\\n")
+                cr = buf.find(b"\\r")
+                if nl < 0 and cr < 0:
+                    break
+                if nl < 0:
+                    idx = cr
+                elif cr < 0:
+                    idx = nl
+                else:
+                    idx = min(nl, cr)
+                segment = bytes(buf[:idx]).decode("utf-8", errors="replace")
+                del buf[: idx + 1]
+                _emit(segment)
+        if buf:
+            _emit(bytes(buf).decode("utf-8", errors="replace"))
     finally:
         proc.wait()
     return proc.returncode, "\\n".join(tail[-50:])
