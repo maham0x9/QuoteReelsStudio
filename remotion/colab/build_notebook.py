@@ -322,11 +322,33 @@ log(f"GPU encoder (h264_nvenc) detected: {NVENC_AVAILABLE}")
 # --- Streamed subprocess --------------------------------------------------
 # Used by every Node/Remotion command we run. Reads raw bytes from stdout
 # and splits on BOTH "\\n" and "\\r" so we still see Remotion's progress
-# updates (which use carriage returns to rewrite the same line). Throttles
-# progress prints if a regex is supplied, enforces a timeout, and returns
-# (returncode, last_50_lines_joined) so the tail is always available for
-# error reporting.
+# updates (which use carriage returns to rewrite the same line). When
+# progress_re-style render output is detected the renderer also tracks
+# the current phase ("Bundling" / "Rendering frames" / "Encoding video"),
+# elapsed time, and an ETA based on frames-per-second so the log shows:
+#   Rendering frames: 142/600 (23.7%) — elapsed 12s, ~38s left
+# If the renderer goes silent for a while a heartbeat is printed so the
+# cell never looks frozen.
 import os as _os_for_env
+import re as _re_for_progress
+import select as _select_for_io
+
+# Module-level so list_compositions and render both refer to the same regexes.
+RENDER_PHASE_RE = _re_for_progress.compile(
+    r"\\b(Bundling|Rendering(?:\\s+frames)?|Encoding(?:\\s+video)?)\\b",
+    _re_for_progress.IGNORECASE,
+)
+RENDER_COUNT_RE = _re_for_progress.compile(r"(\\d+)\\s*/\\s*(\\d+)")
+
+def _fmt_dur(seconds: float) -> str:
+    s = int(max(0, seconds))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
 
 def run_streamed(
     cmd: list[str],
@@ -335,6 +357,7 @@ def run_streamed(
     progress_re=None,
     prefix: str = "    ",
     quiet: bool = False,
+    heartbeat_s: int = 30,
 ) -> tuple[int, str]:
     env = _os_for_env.environ.copy()
     env.setdefault("FORCE_COLOR", "0")
@@ -348,43 +371,109 @@ def run_streamed(
     deadline = time.time() + timeout_s
     tail: list[str] = []
     last_print = 0.0
+    last_output = time.time()
     buf = bytearray()
+    # Render-progress state.
+    phase: str | None = None
+    phase_start: float | None = None
+    last_cur = 0
+    last_total = 0
+
+    def _normalize_phase(raw: str) -> str:
+        low = raw.lower()
+        if low.startswith("bundl"):
+            return "Bundling"
+        if low.startswith("encod"):
+            return "Encoding video"
+        return "Rendering frames"
 
     def _emit(line: str) -> None:
-        nonlocal last_print
+        nonlocal last_print, last_output, phase, phase_start, last_cur, last_total
         line = line.rstrip()
         if not line:
             return
         tail.append(line)
         if len(tail) > 80:
             del tail[: len(tail) - 80]
-        now = time.time()
+        last_output = time.time()
         if progress_re is not None:
-            m = progress_re.search(line)
-            if m and (now - last_print) > 1.0:
-                phase, cur, total = m.group(1), m.group(2), m.group(3)
+            phase_m = RENDER_PHASE_RE.search(line)
+            if phase_m:
+                normalized = _normalize_phase(phase_m.group(1))
+                if normalized != phase:
+                    phase = normalized
+                    phase_start = time.time()
+                    last_cur = 0
+                    last_total = 0
+                    log(f"{prefix}{phase}…")
+            count_m = RENDER_COUNT_RE.search(line)
+            if count_m and phase:
                 try:
-                    pct = (int(cur) / int(total)) * 100
-                except (ValueError, ZeroDivisionError):
-                    pct = 0.0
-                log(f"{prefix}{phase}: {cur}/{total} ({pct:0.1f}%)")
-                last_print = now
-            elif not m and ("error" in line.lower() or "✘" in line):
+                    cur = int(count_m.group(1))
+                    total = int(count_m.group(2))
+                except ValueError:
+                    cur = total = 0
+                if total > 0 and 0 <= cur <= total and cur >= last_cur:
+                    last_cur, last_total = cur, total
+                    now = time.time()
+                    final = cur == total
+                    if final or (now - last_print) > 1.0:
+                        elapsed = now - (phase_start or now)
+                        pct = (cur / total) * 100.0
+                        if cur > 0 and elapsed > 0.5:
+                            est_total = elapsed * total / cur
+                            remaining = max(0.0, est_total - elapsed)
+                            fps = cur / elapsed
+                            log(
+                                f"{prefix}{phase}: {cur}/{total} ({pct:0.1f}%)"
+                                f" — elapsed {_fmt_dur(elapsed)},"
+                                f" ~{_fmt_dur(remaining)} left,"
+                                f" {fps:0.1f} fps"
+                            )
+                        else:
+                            log(f"{prefix}{phase}: {cur}/{total} ({pct:0.1f}%)")
+                        last_print = now
+            elif not count_m and ("error" in line.lower() or "✘" in line):
                 log(f"{prefix}{line}")
         elif not quiet:
             log(f"{prefix}{line}")
 
     try:
         assert proc.stdout is not None
+        fd = proc.stdout.fileno()
         while True:
             if time.time() > deadline:
                 proc.kill()
                 raise TimeoutError(f"command exceeded {timeout_s}s: {' '.join(cmd[:3])}")
-            chunk = proc.stdout.read1(4096) if hasattr(proc.stdout, "read1") else proc.stdout.read(4096)
+            # Wait up to 1s for data so heartbeats can fire on silent renders.
+            rlist, _, _ = _select_for_io.select([fd], [], [], 1.0)
+            if not rlist:
+                if progress_re is not None and (time.time() - last_output) > heartbeat_s:
+                    if phase and phase_start is not None:
+                        elapsed = time.time() - phase_start
+                        if last_cur > 0 and last_total > 0 and elapsed > 0.5:
+                            fps = last_cur / elapsed
+                            log(
+                                f"{prefix}{phase}: {last_cur}/{last_total}"
+                                f" — still working,"
+                                f" {_fmt_dur(elapsed)} elapsed,"
+                                f" {fps:0.1f} fps"
+                            )
+                        else:
+                            log(f"{prefix}{phase}: still working ({_fmt_dur(elapsed)} elapsed)")
+                    else:
+                        log(f"{prefix}still working… ({_fmt_dur(time.time() - last_output)} since last output)")
+                    last_output = time.time()
+                if proc.poll() is not None:
+                    break
+                continue
+            try:
+                chunk = _os_for_env.read(fd, 4096)
+            except OSError:
+                chunk = b""
             if not chunk:
                 if proc.poll() is not None:
                     break
-                time.sleep(0.05)
                 continue
             buf.extend(chunk)
             while True:
